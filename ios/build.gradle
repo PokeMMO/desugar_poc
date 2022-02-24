@@ -1,0 +1,128 @@
+sourceSets.main.java.srcDirs = [ "src/" ]
+
+sourceCompatibility = '1.8'
+[compileJava, compileTestJava]*.options*.encoding = 'UTF-8'
+
+ext {
+	mainClassName = "com.mygdx.game.IOSLauncher"
+}
+
+launchIPhoneSimulator.dependsOn build
+launchIPadSimulator.dependsOn build
+launchIOSDevice.dependsOn build
+createIPA.dependsOn build
+
+robovm {
+	archs = "arm64"
+    iosSkipSigning = true
+}
+
+eclipse.project.name = appName + "-ios"
+
+configurations { r8 }
+
+dependencies {
+    r8 'com.android.tools:r8:3.1.51'
+}
+
+
+//Create an uber jar with everything except base runtime/other robovm.xml dependencies
+task uberJar(type: Jar, dependsOn: jar) {
+    archiveFileName = 'uber.jar'
+    
+    dependsOn configurations.runtimeClasspath
+    from {
+    	configurations.runtimeClasspath.collect {
+    		//Don't include base runtime/robovm specific packages, as well as packages which contain their own robovm.xml
+    		//Packages containing a robovm.xml need to be passed to robovm seperately.
+    		//This will need to be less fragile, but works for POC.
+	    	if(!it.name.startsWith("robovm-rt") && !it.name.startsWith("robovm-cocoatouch") && !it.name.startsWith("robovm-objc") && !it.name.endsWith("-natives-ios.jar")) {
+	    		it.isDirectory() ? it : zipTree(it) 
+			}
+    	}
+    }
+    
+    duplicatesStrategy = DuplicatesStrategy.EXCLUDE
+    
+    with jar
+}
+
+task d8(type: JavaExec, dependsOn: uberJar) {
+    classpath = configurations.r8
+    main = "com.android.tools.r8.D8"
+    workingDir = project.getProjectDir().getAbsolutePath()
+    args '--lib', '../desugar/android-v21.jar', '--release', '--classfile', '--min-api', '21', '--desugared-lib', '../desugar/desugar_jdk_libs.json', '--output', 'build/libs/d8.jar', 'build/libs/uber.jar'
+   
+    inputs.files 'build/libs/uber.jar'
+    outputs.file 'build/libs/d8.jar'
+}
+
+task l8(type: JavaExec, dependsOn: uberJar) {
+    classpath = configurations.r8
+    main = "com.android.tools.r8.L8"
+    workingDir = project.getProjectDir().getAbsolutePath()
+    args '--lib', '../desugar/android-v21.jar', '--release', '--classfile', '--min-api', '21', '--desugared-lib', '../desugar/desugar_jdk_libs.json', '--output', 'build/libs/l8.jar', '../desugar/desugar_jdk_libs-1.1.5.jar'
+   
+    inputs.files 'build/libs/uber.jar'
+    outputs.file 'build/libs/l8.jar'
+}
+
+task desugar(type: Jar, dependsOn: [d8, l8]) {
+    archiveFileName = 'desugar.jar'
+    
+    from {
+    	zipTree('build/libs/l8.jar') 
+    }
+    from {
+    	zipTree('build/libs/d8.jar') 
+    }
+    from(zipTree('build/libs/uber.jar')) {
+    	exclude('**/*.class')
+    	exclude('*.class')
+	}
+    
+    duplicatesStrategy = DuplicatesStrategy.INCLUDE
+ 
+    manifest {
+        attributes 'Main-Class': project.mainClassName
+		attributes 'Multi-Release': true
+    }
+}
+
+
+
+
+import org.robovm.compiler.config.Arch;
+import org.robovm.compiler.config.Config;
+import org.robovm.compiler.AppCompiler;
+
+abstract class CustomArchiveTask extends org.robovm.gradle.tasks.ArchiveTask {
+
+    protected boolean shouldArchive() {
+        return true;
+    }
+
+    @Override
+    protected Config.Builder configure(Config.Builder builder) {
+		println("Starting CustomArchiveTask");
+       	builder = super.configure(builder);
+       	
+       	builder.clearClasspathEntries();
+       	
+       	builder.addClasspathEntry(new File(project.buildDir, 'libs/desugar.jar'))
+       	
+       	//Add all of the artifacts we missed before
+       	for(File file : project.getConfigurations().getByName(JavaPlugin.RUNTIME_CLASSPATH_CONFIGURATION_NAME).getFiles()) {
+       		if(file.name.startsWith("robovm-rt") || file.name.startsWith("robovm-cocoatouch") || file.name.startsWith("robovm-objc") || file.name.endsWith("-natives-ios.jar")) {
+       			builder.addClasspathEntry(file);
+			}
+       	}
+		
+		println("Customized CustomArchiveTask Classpath: " + builder.config.getClasspath());
+		return builder;
+    }
+}
+
+// Create a task using the task type
+tasks.register('createIPA2', CustomArchiveTask)
+createIPA2.dependsOn desugar
